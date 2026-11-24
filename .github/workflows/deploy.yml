@@ -1,0 +1,82 @@
+name: Deploy
+
+# Runs after CI succeeds on main (image already in GHCR), or by hand.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # OIDC token for azure/login
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+# Non-secret names, set as repository *variables* (Settings > Secrets and variables > Variables).
+env:
+  RG: ${{ vars.AZ_RESOURCE_GROUP }}
+  API_APP: ${{ vars.AZ_API_APP }}
+  FUNC_APP: ${{ vars.AZ_FUNC_APP }}
+  STORAGE: ${{ vars.AZ_STORAGE_ACCOUNT }}
+
+jobs:
+  deploy:
+    # Skipped until Azure is set up (repository variable AZ_RESOURCE_GROUP defined).
+    if: >-
+      vars.AZ_RESOURCE_GROUP != '' &&
+      (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    environment: production   # required reviewer = manual approval
+    steps:
+      - name: Resolve commit
+        id: sha
+        run: echo "sha=${{ github.event.workflow_run.head_sha || github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.sha.outputs.sha }}
+
+      - name: Azure login (OIDC, user-assigned managed identity, no secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Update Container App (API)
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}/api:${{ steps.sha.outputs.sha }}"
+          az containerapp update -n "$API_APP" -g "$RG" --image "$IMAGE" \
+            --set-env-vars GIT_SHA=${{ steps.sha.outputs.sha }} -o none
+          echo "Deployed $IMAGE"
+
+      - name: Deploy Function App (Flex Consumption)
+        uses: Azure/functions-action@v1
+        with:
+          app-name: ${{ env.FUNC_APP }}
+          package: functions
+          sku: flexconsumption
+          remote-build: true
+
+      - name: Publish dashboard to $web
+        run: |
+          FUNC_HOST=$(az functionapp show -n "$FUNC_APP" -g "$RG" --query defaultHostName -o tsv)
+          echo "window.DASHBOARD_CONFIG = { recentUrl: \"https://$FUNC_HOST/api/recent\" };" > web/config.js
+          # Contributor can list the account key at runtime: nothing is stored in GitHub.
+          az storage blob upload-batch --account-name "$STORAGE" --auth-mode key \
+            -d '$web' -s web --overwrite -o none
+
+      - name: Smoke test (GET /version must report this commit)
+        run: |
+          FQDN=$(az containerapp show -n "$API_APP" -g "$RG" --query properties.configuration.ingress.fqdn -o tsv)
+          for i in $(seq 1 12); do
+            V=$(curl -fsS "https://$FQDN/version" || true)
+            echo "$V"
+            echo "$V" | grep -q "${{ steps.sha.outputs.sha }}" && exit 0
+            sleep 10
+          done
+          echo "API did not report the new commit"; exit 1

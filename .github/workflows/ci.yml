@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  API_VERSION: "1.0.0"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: pip install -r api/requirements-dev.txt -r functions/requirements.txt
+      - name: Lint (ruff)
+        run: ruff check .
+      - name: API tests
+        working-directory: api
+        run: pytest -q
+      - name: Functions tests
+        working-directory: functions
+        run: pytest -q
+
+  image:
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}/api" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: api/Dockerfile
+          push: true
+          build-args: |
+            API_VERSION=${{ env.API_VERSION }}
+            GIT_SHA=${{ github.sha }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ env.API_VERSION }}
+            ${{ steps.meta.outputs.image }}:${{ github.sha }}
+            ${{ steps.meta.outputs.image }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Check image size (< 500 MB)
+        run: |
+          docker pull -q ${{ steps.meta.outputs.image }}:${{ github.sha }}
+          SIZE=$(docker image inspect ${{ steps.meta.outputs.image }}:${{ github.sha }} --format '{{.Size}}')
+          echo "Image size: $((SIZE/1024/1024)) MB"
+          test "$SIZE" -lt 524288000

@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ML Pipeline Dashboard</title>
+  <script src="config.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js"></script>
+  <style>
+    :root { --bg:#f6f8fa; --card:#fff; --ink:#1f2328; --muted:#656d76; --line:#d8dee4;
+            --ok:#1a7f37; --bad:#cf222e; --accent:#0f766e; }
+    * { box-sizing: border-box; }
+    body { margin:0; font:14px/1.5 system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--ink); }
+    header { background:var(--accent); color:#fff; padding:16px 24px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; }
+    header h1 { margin:0; font-size:18px; }
+    #status { font-size:12px; opacity:.9; }
+    main { max-width:1100px; margin:0 auto; padding:20px 16px; display:grid; gap:16px; }
+    .kpis { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px 16px; }
+    .kpi .v { font-size:24px; font-weight:600; font-variant-numeric:tabular-nums; }
+    .kpi .l { color:var(--muted); font-size:12px; }
+    .charts { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:16px; }
+    .charts canvas { max-height:260px; }
+    table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+    th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); white-space:nowrap; }
+    th { color:var(--muted); font-weight:500; font-size:12px; }
+    .tbl { overflow-x:auto; }
+    .pill { padding:1px 8px; border-radius:10px; font-size:12px; color:#fff; }
+    .malignant { background:var(--bad); } .benign { background:var(--ok); }
+    h2 { margin:0 0 8px; font-size:15px; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>Event-driven ML pipeline: latest inferences</h1>
+  <span id="status">loading…</span>
+</header>
+<main>
+  <section class="kpis">
+    <div class="card kpi"><div class="v" id="k-files">–</div><div class="l">files (last 20)</div></div>
+    <div class="card kpi"><div class="v" id="k-rows">–</div><div class="l">rows scored</div></div>
+    <div class="card kpi"><div class="v" id="k-pos">–</div><div class="l">malignant predictions</div></div>
+    <div class="card kpi"><div class="v" id="k-lat">–</div><div class="l">median upload→result (s)</div></div>
+  </section>
+  <section class="charts">
+    <div class="card"><h2>Upload → result latency per file (s)</h2><canvas id="c-lat"></canvas></div>
+    <div class="card"><h2>Predicted classes (rows)</h2><canvas id="c-cls"></canvas></div>
+  </section>
+  <section class="card tbl">
+    <h2>Last 20 inferences</h2>
+    <table>
+      <thead><tr><th>Time (UTC)</th><th>File</th><th>Rows</th><th>Result</th><th>Malignant rows</th>
+        <th>Confidence</th><th>Model</th><th>Model ms</th><th>End-to-end s</th></tr></thead>
+      <tbody id="rows"><tr><td colspan="9">No data yet</td></tr></tbody>
+    </table>
+  </section>
+</main>
+<script>
+  const API = (window.DASHBOARD_CONFIG || {}).recentUrl || "/api/recent";
+  const REFRESH_MS = 30000;
+  const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+  const latChart = new Chart(document.getElementById("c-lat"), {
+    type: "bar", data: { labels: [], datasets: [{ label: "seconds", data: [], backgroundColor: "#0f766e" }] },
+    options: { plugins: { legend: { display: false } }, scales: { x: { ticks: { display: false } } } }
+  });
+  const clsChart = new Chart(document.getElementById("c-cls"), {
+    type: "doughnut", data: { labels: ["benign", "malignant"], datasets: [{ data: [0, 0], backgroundColor: ["#1a7f37", "#cf222e"] }] }
+  });
+
+  async function refresh() {
+    try {
+      const res = await fetch(API, { cache: "no-store" });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const items = await res.json();
+      render(items);
+      document.getElementById("status").textContent = "updated " + new Date().toLocaleTimeString() + " · refresh 30 s";
+    } catch (e) {
+      document.getElementById("status").textContent = "error: " + e.message;
+    }
+  }
+
+  function render(items) {
+    const rows = items.reduce((a, i) => a + (i.rows || 0), 0);
+    const pos = items.reduce((a, i) => a + (i.positives || 0), 0);
+    const lats = items.map(i => i.endToEndMs).filter(v => v != null).sort((a, b) => a - b);
+    const median = lats.length ? (lats[Math.floor(lats.length / 2)] / 1000).toFixed(1) : "–";
+    document.getElementById("k-files").textContent = items.length;
+    document.getElementById("k-rows").textContent = rows;
+    document.getElementById("k-pos").textContent = pos;
+    document.getElementById("k-lat").textContent = median;
+
+    const chrono = [...items].reverse();
+    latChart.data.labels = chrono.map(i => i.fileName);
+    latChart.data.datasets[0].data = chrono.map(i => i.endToEndMs != null ? +(i.endToEndMs / 1000).toFixed(2) : null);
+    latChart.update();
+    clsChart.data.datasets[0].data = [rows - pos, pos];
+    clsChart.update();
+
+    document.getElementById("rows").innerHTML = items.length ? items.map(i => `
+      <tr><td>${esc((i.timestamp || "").replace("T", " ").slice(0, 19))}</td>
+      <td>${esc(i.fileName)}</td><td>${esc(i.rows)}</td>
+      <td><span class="pill ${esc(i.prediction)}">${esc(i.prediction)}</span></td>
+      <td>${esc(i.positives)}</td><td>${esc(i.confidence)}</td><td>${esc(i.modelVersion)}</td>
+      <td>${esc(i.modelLatencyMs)}</td><td>${i.endToEndMs != null ? (i.endToEndMs / 1000).toFixed(1) : "–"}</td></tr>`).join("")
+      : '<tr><td colspan="9">No data yet</td></tr>';
+  }
+
+  refresh();
+  setInterval(refresh, REFRESH_MS);
+</script>
+</body>
+</html>
